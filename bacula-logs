@@ -13,6 +13,7 @@ use POSIX qw(strftime);
 use DBI;
 
 use FindBin;
+use lib "$FindBin::Bin";
 use lib "$FindBin::Bin/../lib/site_perl";
 use Bacula::DatabaseConfig;
 
