@@ -1,0 +1,514 @@
+#! /usr/bin/perl -w
+
+# bacula-du 1.8
+# Written by Kjetil Torgrim Homme <kjetil.homme@redpill-linpro.com>
+# Copyright 2011-2018
+# Released under GPLv3 or the same terms as Bacula itself
+
+sub usage {
+    print STDERR <<"_END_";
+Usage: $0 [OPTIONS] -j JOBID [FILES]
+       $0 --md5sum -j JOBID [FILES]
+Summarize disk usage of directories included in the backup JOBID
+
+Alternate mode:
+  --md5sum              output list of all files in job in md5sum format
+
+Options are:
+  -a, --all             write counts for all files, not just directories
+                        (will skip zero-sized files, see --threshold)
+  --apparent-size       use size in octets rather than number of blocks
+  -B, --block-size=SIZE report SIZE-byte blocks (default 1Ki)
+  -b, --bytes           like --block-size=1 --apparent-size
+  -k                    like --block-size=1Ki
+  -m                    like --block-size=1Mi
+  -i, --inodes          report number of files, not size
+  --count-deleted       include deleted files (Accurate mode information)
+                        Only relevant for --inodes.
+  -S, --separate-dirs   do not include size of subdirectories
+  -t, --threshold=SIZE  skip output for files or directories with usage
+                        below SIZE.  default is 1 octet.
+  -L, --largest=NUM     only print NUM largest directories/files
+  -q, --quiet           be quiet (do not print database progress)
+  --format FMT          change output format from "%9s %n"
+  --stat                multiline output format similar to stat(1), implies -a
+
+SIZE may be (or may be an integer optionally followed by) one of following:
+k (1000), Ki (1024), M (1000*1000), Mi (1024*1024), G, Gi, T, Ti, P, Pi.
+
+FMT supports the format sequences from stat(1) as much as possible.
+Extensions: 
+  %S is file size in units of block-size (default KiB).
+  %I is fileindex (Bacula internal information)
+
+If a filename in FILES ends with /, recursion will *not* be done if
+that directory is present in the backup (to enable fast --stat).
+_END_
+    print STDERR Bacula::DatabaseConfig::HELP_MESSAGE();
+
+    exit(64);
+}
+
+use strict;
+use DBI;
+use Getopt::Long qw(:config bundling no_ignore_case);
+use FindBin;
+use lib "$FindBin::Bin/../lib/site_perl";
+use Bacula::DatabaseConfig 1.0;
+use POSIX qw(strftime);
+use Fcntl ':mode';
+use Data::Dumper;
+
+my %base64 = base64_map();
+my %fmt_seq = stat_format_sequences();
+my $fmt_letters = join("", sort keys %fmt_seq);
+
+my $threshold = 1; # omit 0 octet sized files/directories by default
+my $blocksize = 1024;
+my ($jobid, $all, $apparent_size, $separate_dirs, $largest, $md5sum);
+my ($inodes, $count_deleted);
+my ($quiet, $format);
+my $debug = 0;
+my $stat_format = <<"_END_";
+  File: %n
+  Size: %-15s Blocks: %-10b IO Block: %-6o %F
+Device: %Dh/%dd	Inode: %-11i Links: %h
+Access: %04a            Uid: %u   Gid: %g
+Access: %x
+Modify: %y
+Change: %z
+_END_
+
+my $dbconfig = new Bacula::DatabaseConfig;
+
+GetOptions("jobid|j=i" => \$jobid,
+           "threshold|t=s" => \$threshold,
+           "separate-dirs|S" => \$separate_dirs,
+           "all|a" => \$all,
+           "quiet|q" => \$quiet,
+           "debug+" => \$debug,
+           "apparent-size" => \$apparent_size,
+           "bytes|b" => sub { $apparent_size = 1; $blocksize = "1" },
+           "block-size|B=s" => \$blocksize,
+           "inodes|i" => sub { $inodes = $apparent_size = 1; $blocksize = "1" },
+           "count-deleted" => \$count_deleted,
+           "largest|L=i" => \$largest,
+           "format=s" => \$format,
+           "md5sum" => \$md5sum,
+           "stat" => sub { $all = 1; $format = $stat_format; },
+           "k" => sub { $blocksize = "1Ki" },
+           "m" => sub { $blocksize = "1Mi" },
+    ) || usage();
+
+usage() unless $jobid;
+usage() if grep { ! (m,^/, || m,^[a-z]:/,i) } @ARGV;
+
+$threshold = convert_units($threshold);
+$blocksize = convert_units($blocksize);
+
+my $dbh = $dbconfig->connect();
+
+unless ($quiet) {
+    my $count = $dbh->selectrow_array(
+        "SELECT JobFiles FROM Job WHERE JobId = $jobid");
+    print STDERR "This may take some time, $count file entries in job $jobid\n"
+        if $count > 1000000;
+}
+
+my %du;
+my %filestat;
+my $duration;
+if (@ARGV) {
+    for (@ARGV) {
+        fetch_usage(\%du, \%filestat, $_);
+    }
+} else {
+    fetch_usage(\%du, \%filestat);
+}
+
+$dbh->disconnect();
+print STDERR "done reading database.\n" if !$quiet && $duration;
+
+if ($largest) {
+    my @sizes = sort { $a <=> $b } values %du;
+    my $cutoff = $largest < @sizes ? $sizes[-$largest] : 0;
+    $threshold = $cutoff unless ($threshold && $threshold > $cutoff);
+}
+
+# We add ~ to the filename so that the parent directory is printed
+# below the children.  ('~' could be any character which sorts after
+# '/')
+for my $path (sort { "$a~" cmp "$b~" } keys %du) {
+    next if $du{$path} < $threshold;
+    if ($format) {
+        print format_lstat($format, $path, extract_lstat($filestat{$path})), "\n"
+            if exists $filestat{$path}
+    } else {
+        printf("%9d %s\n", user_blocks($du{$path}), $path);
+    }
+}
+
+# Look up specified path and put data in %{$du}, or all files in job
+# if undef.  In md5sum mode, print directly.
+#
+# TODO:
+#
+# * Rewrite to handle an array in @top and don't do one query per
+#   element in FILES
+# * Only distinguish between trailing / or not in --stat mode
+#
+sub fetch_usage {
+    my ($du, $filestat, $top) = @_;
+
+    my ($query, $root);
+    my @params;
+
+    my $columns = "p.Path, f.Name, LStat";
+    $columns = "p.Path, f.Name, MD5" if $md5sum;
+    $columns = "p.Path, f.Name" if $inodes;
+
+    if ($dbconfig->has_filename_table) {
+        # Bareos 16 and older
+        $query = "
+           SELECT $columns
+           FROM Path p
+             JOIN File ON File.PathId = p.PathId
+             JOIN Filename f ON f.FilenameId = File.FilenameId
+           WHERE File.JobId = $jobid";
+    } else {
+        $query = "
+           SELECT $columns
+           FROM Path p
+             JOIN File f ON f.PathId = p.PathId
+           WHERE f.JobId = $jobid";
+    }
+    
+    $root = "/";
+    if (defined $top) {
+        my ($pathid, $filename) = is_file($top);
+        $root = $top;
+        if (defined $pathid) {
+            if ($dbconfig->has_filename_table) {
+                $query = "
+                   SELECT $columns
+                   FROM Path p
+                     JOIN File ON File.PathId = p.PathId
+                     JOIN Filename f ON File.FilenameId = f.FilenameId
+                   WHERE f.JobId = $jobid
+                     AND f.PathId = $pathid AND File.Filenameid = $filename";
+            } else {
+                $query = "
+                   SELECT $columns
+                   FROM Path p
+                     JOIN File f ON f.PathId = p.PathId
+                   WHERE f.JobId = $jobid
+                     AND f.PathId = $pathid AND f.Filename = ?";
+                @params = ($filename);
+            }                
+            $root =~ s,[^/]*$,,;
+        } else {
+            $root .= '/' unless $root =~ m,/$,;
+        }
+    }        
+    $query .= " AND f.FileIndex > 0" unless $count_deleted;
+
+    my $sth;
+    if ($dbconfig->dsn =~ /^dbi:Pg:/i && $dbh->can("pg_cancel")) {
+        # Just setting $SIG{INT} won't work, DBI blocks the signal
+        use POSIX qw(:signal_h);
+        my $action = POSIX::SigAction->new(
+            sub {
+                print STDERR "Cancelling query...\n";
+                $dbh->pg_cancel();
+                exit 127;
+            });
+        my $oldaction = POSIX::SigAction->new();
+        sigaction(SIGINT, $action, $oldaction);
+
+        $sth = $dbh->prepare($query, {pg_async => 1});
+        $sth->execute(@params);
+        $dbh->pg_result;
+
+        sigaction(SIGINT, $oldaction);
+    } else {
+        $sth = $dbh->prepare($query);
+        $sth->execute(@params);
+    }
+
+    my $rowcount = 0;
+    my $start = time();
+    my $extract_size;
+
+    if ($md5sum) {
+        while (my ($path, $fname, $md5) = $sth->fetchrow_array) {
+            if ($md5 eq '0') {
+                # mostly symlinks or deleted files
+                print "$path$fname: skipped ($md5)\n" if $debug;
+                next;
+            }
+            next if $root ne '/' && $path !~ m,^$root,;
+            print decode_bacula_md5sum($md5), "  ", $path, $fname, "\n";
+        }
+    } elsif ($inodes) {
+        while (my ($path, $fname) = $sth->fetchrow_array) {
+            print "[$path] [$fname]\n" if $debug > 1;
+            next if $root ne '/' && $path !~ m,^$root,;
+            $du->{$path} += 1;
+            next if $separate_dirs;
+            until ($path eq $root || $path =~ /^[A-Za-z]:\/$/) {
+                $path =~ s,[^/]+/$,,;
+                $du->{$path} += 1;
+            }
+            if ((++$rowcount % 1000) == 0) {
+                $duration = time() - $start;
+                print STDERR "got $rowcount rows\r" if !$quiet && $duration;
+            }
+        }
+    } else {
+        while (my ($path, $fname, $lstat) = $sth->fetchrow_array) {
+            print "[$path] [$fname]\n" if $debug > 1;
+            next if $root ne '/' && $path !~ m,^$root,;
+            unless ($extract_size) {
+                if ($path =~ m!^([A-Z]:/)!i) {
+                    # Bacula on Windows always stores block size as 0.
+                    $extract_size = \&extract_size_from_lstat;
+                    $root = $1;
+                } elsif ($apparent_size) {
+                    $extract_size = \&extract_size_from_lstat;
+                } else {
+                    $extract_size = \&extract_blocks_from_lstat;
+                }
+            }
+
+            my $size = $extract_size->($lstat);
+            $du->{"$path$fname"} += $size if $all;
+            $du->{$path} += $size;
+            $filestat->{"$path$fname"} = $lstat if $format && $all;
+            next if $separate_dirs;
+            until ($path eq $root || $path =~ /^[A-Za-z]:\/$/) {
+                $path =~ s,[^/]+/$,,;
+                $du->{$path} += $size;
+            }
+            if ((++$rowcount % 1000) == 0) {
+                $duration = time() - $start;
+                print STDERR "got $rowcount rows\r" if !$quiet && $duration;
+            }
+        }
+    }
+
+}
+
+# Checks if specific path exists as non-directory in job, and returns
+# pathid,filenameid if so.  
+sub is_file {
+    my ($path) = @_;
+
+    my $query;
+    if ($dbconfig->has_filename_table) {
+        $query = "
+          SELECT p.PathId, fn.FilenameId
+          FROM Path p
+            JOIN File f ON f.PathId = p.PathId
+            JOIN Filename fn ON f.FilenameId = fn.FilenameId
+          WHERE f.JobId = $jobid AND p.Path = ? AND fn.Name = ?";
+    } else {
+        $query = "
+          SELECT p.PathId, f.Name
+          FROM Path p
+            JOIN File f ON f.PathId = p.PathId
+          WHERE f.JobId = $jobid AND p.Path = ? AND f.Name = ?";
+    }
+    my $sth = $dbh->prepare($query);
+    $path =~ m,(.*/)(.*),;
+    $sth->execute($1, $2);
+    $sth->fetchrow_array;
+}
+
+# Return hash with numeric value of each letter in base64 alphabet,
+# stored in global variable at beginning of script for performance.
+sub base64_map {
+    my $i = 0;
+    map { $_ => $i++ } split("", "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/");
+}
+
+sub decode_bacula_base64 {
+    my $acc = 0;
+    for (split("", $_[0])) {
+        $acc <<= 6;
+        $acc += $base64{$_};
+    }
+    return $acc;
+}
+
+# This is essentially the same as above, but we need to handle 128
+# bits, and Perl integers are typically 64 bits.  With a separate
+# function the normal case is kept efficient, and this code simple.
+# Returns value as hexstring.
+sub decode_bacula_md5sum {
+    my ($coded) = @_;
+    my $acc;
+    my $hex = '';
+    my @digits = split("", $coded);
+
+    # I do not trust Bacula to code leading zeroes (it does in my version, but...)
+    unshift(@digits, 'A') while @digits < 22;
+
+    # unroll'd for performance and simplicity
+    # (I tried Math::BigInt: it ran 65x slower)
+    for (1,2,3,4,5) {
+        $acc = $base64{shift(@digits)};
+        $acc <<= 6;
+        $acc += $base64{shift(@digits)};
+        $acc <<= 6;
+        $acc += $base64{shift(@digits)};
+        $acc <<= 6;
+        $acc += $base64{shift(@digits)};
+        $hex .= sprintf("%06x", $acc);
+    }
+    $acc = $base64{shift(@digits)};
+    $acc <<= 6;
+    $acc += $base64{shift(@digits)};
+    $hex .= sprintf("%03x", $acc);
+    # The last 4 bits in the last digit are bogus (and should be 0)
+    warn "$hex: corrupt md5sum: $coded: data in last nybble"
+        if chop($hex) ne "0";
+    return $hex;
+}
+
+sub stat_format_sequences {
+    # each array contains lstat index, printf format character.
+    # the optional third element is an subroutine to format value
+    (
+        'a' => [2, 'o', sub { $_[0] & ~S_IFMT }],  # access rights in octal
+        'A' => [-1],      # TODO: access rights in human readable form
+        'b' => [9, 'd'],  # number of blocks allocated (see %B)
+        'B' => [-1],      # TODO: the size in bytes of each block reported by %b (always 512)
+        'C' => [-1],      # IMPOSSIBLE: SELinux security context string
+        'd' => [0, 'd'],  # device number in decimal
+        'D' => [0, 'x'],  # device number in hex
+        'f' => [2, 'x'],  # raw mode in hex
+        'F' => [2, 's', \&file_type], # file type
+        'g' => [5, 'd'],  # group ID of owner
+        'G' => [-1],      # IMPOSSIBLE: group name of owner
+        'h' => [3, 'd'],  # number of hard links
+        'i' => [1, 'd'],  # inode number
+        'I' => [14, 'd'], # bacula-du extension: FileIndex
+        'm' => [-1],      # IMPOSSIBLE: mount point
+        'n' => [14, 's'], # file name
+        'N' => [-1],      # TODO: quoted file name with dereference if symbolic link
+        'o' => [8, 'd'],  # optimal I/O transfer size hint
+        's' => [7, 'd'],  # total size, in bytes
+        'S' => [7, 'd', \&user_blocks ],  # bacula-du extension: size in unit specified via -B,-k,-m
+        't' => [6, 'x', sub { $_[0] >> 8 }],  # major device type in hex, for character/block device special files
+        'T' => [6, 'x', sub { $_[0] & 255 }], # minor device type in hex, for character/block device special files
+        'u' => [4, 'd'],  # user ID of owner
+        'U' => [-1],      # IMPOSSIBLE: user name of owner
+        'w' => [-1],      # IMPOSSIBLE: time of file birth, human-readable; - if unknown
+        'W' => [-1],      # IMPOSSIBLE: time of file birth, seconds since Epoch; 0 if unknown
+        'x' => [10, 's', \&iso8601], # time of last access, human-readable
+        'X' => [10, 'd'],            # time of last access, seconds since Epoch
+        'y' => [11, 's', \&iso8601], # time of last data modification, human-readable
+        'Y' => [11, 'd'],            # time of last data modification, seconds since Epoch
+        'z' => [12, 's', \&iso8601], # time of last status change, human-readable
+        'Z' => [12, 'd'],            # time of last status change, seconds since Epoch
+    );
+}
+
+# LStat sequence:
+#    0 dev        device number of filesystem
+#    1 ino        inode number
+#    2 mode       file mode  (type and permissions)
+#    3 nlink      number of (hard) links to the file
+#    4 uid        numeric user ID of file's owner
+#    5 gid        numeric group ID of file's owner
+#    6 rdev       the device identifier (special files only)
+#    7 size       total size of file, in bytes
+#    8 blksize    preferred I/O size
+#    9 blocks     actual number of system-specific blocks allocated
+#   10 atime      last access time in seconds since the epoch
+#   11 mtime      last modify time in seconds since the epoch
+#   12 ctime      inode change time in seconds since the epoch
+#   13 fileindex  optional, only for hardlinked files
+
+sub extract_lstat {
+    map { decode_bacula_base64($_) } split(/ /, $_[0]);
+}
+
+sub format_lstat {
+    my ($fmt, $path, @statinfo) = @_;
+
+    $fmt =~ s/\\n/\n/g;
+    $fmt =~ s/\\t/\t/g;
+
+    # keeping it simple
+    $statinfo[14] = $path;
+
+    my @out = split(/(%-?\d*[$fmt_letters])/o, $fmt);
+    for my $i (0 .. $#out) {
+        if ($out[$i] =~ /%(-?\d*)([$fmt_letters])/o) {
+            my $width = $1 || '';
+            my $letter = $2;
+            if ($fmt_seq{$letter}->[0] < 0) {
+                die "Unknown stat output format sequence '%$letter'\n";
+            } else {
+                my $value = $statinfo[$fmt_seq{$letter}->[0]];
+                if (defined $fmt_seq{$letter}->[2]) {
+                    $value = $fmt_seq{$letter}->[2]->($value);
+                }
+                $out[$i] = sprintf('%' . $width . $fmt_seq{$letter}->[1],
+                                   $value);
+            }
+        }
+    }
+    join('', @out);
+}
+
+# Returns number of bytes based on apparent size
+sub extract_size_from_lstat {
+    decode_bacula_base64((split(/ /, $_[0]))[7]);
+}
+
+# Returns number of bytes based on block count
+sub extract_blocks_from_lstat {
+    decode_bacula_base64((split(/ /, $_[0]))[9]) * 512
+}
+
+sub convert_units {
+    my $num = shift;
+
+    my %units = ("k" => 1000**1, "Ki" => 1024**1, "ki" => 1024**1,
+                 "M" => 1000**2, "Mi" => 1024**2,
+                 "G" => 1000**3, "Gi" => 1024**3,
+                 "T" => 1000**4, "Ti" => 1024**4,
+                 "P" => 1000**5, "Pi" => 1024**5);
+
+    if ($num =~ /^(\d*)([kKMGTP]i?)B?$/) {
+        $num = ($1 ? $1 : 1) * $units{$2};
+    } elsif ($num !~ /^\d+$/) {
+        die "Can't parse unit: $num\n";
+    }
+    return $num;
+}
+
+sub user_blocks {
+    int(($_[0] + $blocksize - 1) / $blocksize);
+}
+
+sub file_type {
+    my ($mode) = @_;
+    my %types = (
+        0140000 => 'socket',
+        0120000 => 'symbolic link',
+        0100000 => 'regular file',
+        0060000 => 'block device',
+        0040000 => 'directory',
+        0020000 => 'character device',
+        0010000 => 'FIFO'
+        );
+    $types{$mode & S_IFMT} || 'UNKNOWN';
+}
+
+sub iso8601 {
+    my ($time) = @_;
+    strftime("%Y-%m-%d %H:%M:%S %z", localtime($time));
+}

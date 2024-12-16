@@ -1,0 +1,382 @@
+#! /usr/bin/perl
+
+# bacula-logs 1.10
+# Copyright 2015-2018 <kjetil.homme@redpill-linpro.com>
+# Released under GPLv3 or later versions
+
+use warnings;
+use strict;
+
+use Time::Local;
+use Getopt::Long;
+use POSIX qw(strftime);
+use DBI;
+
+use FindBin;
+use lib "$FindBin::Bin/../lib/site_perl";
+use Bacula::DatabaseConfig;
+
+my $default_starttime = "23:00";
+
+sub usage {
+    print STDERR ("Error: ", @_, "\n") if @_;
+    print STDERR <<"EOF";
+Usage: $0 [OPTIONS] [JOB ...]
+
+Print logs for JOBS, or print logs for all jobs the last N days (default 1)
+JOB can be job id or a job name (optionally with % wildcard).
+
+Options are:
+
+  --errors-only, -e      only print jobs which failed
+  --warnings, -w         only print jobs which are OK with warnings or failed
+  --ok-only, -O          only print jobs which are OK or OK with warnings
+  --running, -r          include still running jobs
+  --cancels, -C          include cancelled jobs
+  --level-base, -B       only print jobs of level Base
+  --level-full, -F       only print jobs of level Full
+  --level-differen, -D   only print jobs of level Differential
+  --level-incremen, -I   only print jobs of level Incremental
+  --schedule-start HH:MM when day starts (default $default_starttime)
+  --days N               how many whole days of logs (default 1)
+  --hours N              how many hours of logs
+  --backup-exists, -E    only print jobs where backup data exist
+                         (will also skip fresh but empty backups)
+  --year, -Y             shortcut for --days 365
+  --last-run-only, -l    only print the last instance for each job
+                         (with --ok-only, print last successful instance)
+  --pattern, -p PATTERN  only print jobs with a log matching (Perl) PATTERN [*]
+    --ignore-case, -i    case-insensitive pattern search
+    --match-only, m      only print matching log entries
+    --client-log, -c     only match against log entries from client
+                         (without --pattern: only print log entries from client)
+  --exclude-jobs PATTERN do not include job with names matching PATTERN [*]
+  --status-only, -s      do not print logs
+  --extended-info, -X    add field (files, bytes, duration) to status line
+  --simple-status, -S    as --status-only, but without decoration of output
+
+[*] may be given multiple times
+
+EOF
+
+    print STDERR Bacula::DatabaseConfig::HELP_MESSAGE();
+    exit(64);
+}
+
+sub HELP_MESSAGE { usage(); }
+
+my ($errors_only, $warnings, $ok_only, $only_level,
+    $last_run_only, $status_only, $simple_status, $extended_info,
+    $match_only, $ignore_case, $client_log, $backup_exists,
+    $running, $include_cancels, @exclude_jobs,
+    $debug, $verbose);
+my $days = 0;
+my $hours = 0;
+my @patterns;
+my $schedule_start = $default_starttime;
+
+my $dbconfig = new Bacula::DatabaseConfig;
+
+Getopt::Long::Configure qw(bundling);
+
+GetOptions("debug|d" => \$debug,
+           "verbose|v" => \$verbose,
+           "days=i" => \$days,
+           "hours=f" => \$hours,
+           "year|Y" => sub { $days = 365 },
+           "backup-exists|E" => \$backup_exists,
+           "errors-only|e" => \$errors_only,
+           "warnings|w" => sub { $warnings = $errors_only = 1 },
+           "ok-only|O" => \$ok_only,
+           "level-base|B" => sub { $only_level = 'B' },
+           "level-full|F" => sub { $only_level = 'F' },
+           "level-differential|D" => sub { $only_level = 'D' },
+           "level-incremental|I" => sub { $only_level = 'I' },
+           "last-run-only|l" => \$last_run_only,
+           "status-only|s" => \$status_only,
+           "simple-status|S" => sub { $simple_status = $status_only = 1 },
+           "extended-info|X" => \$extended_info,
+           "pattern|p=s" => \@patterns,
+           "ignore-case|i" => \$ignore_case,
+           "client-log|c" => \$client_log,
+           "exclude-jobs=s" => \@exclude_jobs,
+           "match-only|m" => \$match_only,
+           "running|r" => \$running,
+           "cancels|include-cancels|C" => \$include_cancels,
+           "schedule-start" => \$schedule_start
+    ) or usage();
+
+if ($schedule_start =~ /^([012]?\d):([0-5]\d)$/) {
+    $schedule_start = [$1, $2];
+} else {
+    usage();
+}
+
+unless (@patterns) {
+    usage("--ignore-case requires --patterns") if $ignore_case;
+    usage("--match-only requires --patterns") if $match_only;
+}
+if ($hours && $days) {
+    usage("--hours and --days can not be specified together");
+}
+$days ||= 1 unless $hours;
+
+my $columns = $ENV{'COLUMNS'} || 80;
+unless ($simple_status) {
+    # optional library to find size of terminal
+    eval {
+        require Term::Size;
+        $columns = Term::Size::chars(*STDOUT) || 80;
+    };
+}
+
+my $dbh = $dbconfig->connect();
+
+# reusing prepared statements is a huge performance win over slow
+# connections (e.g., VPN :-), so we keep these in global variables
+my ($sth_log, $sth_job, $sth_job_elapsed, $sth_job_elapsed_files);
+my @jobs = @ARGV;
+
+if (@jobs) {
+    @jobs = map { /\D/ ? list_jobs($days, $hours, $_) : $_ } @jobs;
+    unless (@jobs) {
+        print "No matching jobs.\n";
+        exit;
+    }
+    my %uniq;
+    map { $uniq{$_} = 1 } @jobs;
+    @jobs = sort { $a <=> $b } keys %uniq;
+} else {
+    @jobs = list_jobs($days, $hours);
+}
+
+# A full timestamp is 19 characters wide ("2012-09-04 14:48:20")
+# We also want to pad the "C|S|(dir)" column.
+my $continuation_pad = " " x 10 . ":" . " " x 8 . "  ";
+
+for my $jobid (@jobs) {
+    my @output = ();
+    my $found_pattern;
+
+    my ($level, $status, $jobname, $duration, $files, $bytes, $starttime, $mediacount) =
+        job_info($jobid);
+
+    next if grep { $jobname =~ $_ } @exclude_jobs;
+
+    if (! defined $level) {
+        ($level, $status, $jobname, $duration, $files, $bytes, $starttime, $mediacount) =
+            ('????', '?', 'PURGED/UNKNOWN', 0, 0, 0, 0);
+    }
+
+    # duplicate test for job status for $last_run_only
+    next if $status eq 'T' && $errors_only;
+    next if $status eq 'W' && $errors_only && !$warnings;
+    next if $backup_exists && $mediacount == 0;
+
+    $level = { B => 'Base', F => 'Full', D => 'Diff', I => 'Incr' }->{$level};
+    $level ||= '????';
+    my $header;
+    if ($simple_status) {
+        my $mibs = sprintf("%.02f", ($bytes + 4999)/1000000);
+        my $iso8601 = $starttime;
+        $iso8601 =~ s/\s/T/;
+        push(@output, sprintf("%d %s %s %d %d %d %s %s\n",
+                              $jobid, $level, $status,
+                              $files, $bytes, $duration, $iso8601,
+                              $jobname));
+    } else {
+        my $xtd = "";
+        if ($extended_info) {
+            my $dur;
+            if ($duration < 3600) {
+                $dur = sprintf("%d", $duration/60);
+            } else {
+                $dur = sprintf("%d:%02d", $duration/3600, $duration%60);
+            }                
+            $xtd = sprintf("%9d %8.02fG %6sm",
+                           $files, ($bytes + 4999999)/1000000000, $dur);
+            if ($days > 1 || $hours > 24) {
+                $starttime =~ s/:\d\d$//;
+                $xtd .= " [$starttime]";
+            }
+        }
+        my $header = "==== $jobid $level [$status]$xtd $jobname ==";
+        $header .= "=" x ($columns - 1 - length($header))
+            if length $header < $columns - 1;
+        push(@output, $header . "\n");
+    }
+
+    if (!$status_only || @patterns) {
+        unless ($sth_log) {
+            $sth_log = $dbh->prepare("
+                SELECT time, logtext FROM log WHERE jobid = ?
+                ORDER BY time, logid ASC");
+        }
+        my $rv = $sth_log->execute($jobid);
+    
+        while (my ($time, $msg) = $sth_log->fetchrow_array) {
+            # Replace source of log entry with single character (C for
+            # client and S for storage), or nothing if the message comes
+            # from the director itself.
+            my $from;
+            $from = 'fd'
+                if $msg =~ s/^\S+-fd JobId $jobid:/C /;
+            $from = 'sd'
+                if $msg =~ s/^\S+-sd JobId $jobid:/S /;
+            $from = 'dir'
+                if $msg =~ s/^\S+-dir JobId $jobid:/  /;
+            # long fd names can be truncated
+            $from = 'fd'
+                if $msg =~ s/^\S+ JobId $jobid:/C /;
+            # Bacula 2.0 or older does not include JobId in client log
+            # messages.  We can not trust the client name used by the
+            # director to match the name the FD thinks it has
+            # (consider names of service addresses), so we just say
+            # anything else is FD.
+            unless (defined $from) {
+                $from = 'fd';
+                $msg =~ s/^\S+:/C /;
+            }
+            $msg =~ s/^/$continuation_pad /omg;
+            $msg =~ s/^$continuation_pad/$time/s;
+            if (@patterns) {
+                unless (($client_log && $from ne 'fd') or
+                        ($status_only && $found_pattern)) {
+                    for my $p (@patterns) {
+                        if ($ignore_case ? ($msg =~ /$p/i) : ($msg =~ /$p/)) {
+                            ++$found_pattern;
+                            push(@output, $msg) if $match_only;
+                        }
+                    }
+                }
+            } elsif ($client_log) {
+                $msg = '' if $from ne 'fd';
+            }
+            push(@output, $msg) unless $msg eq '' || $status_only || $match_only;
+        }
+    }
+    print @output if !@patterns || $found_pattern;
+}
+
+sub cutoff_time {
+    my ($days, $hours) = @_;
+
+    my $start = time();
+    if ($hours) {
+        $start -= $hours * 3600;
+    } else {
+        $start -= ($days - 1) * 86400;
+    }
+    my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($start);
+    unless ($hours) {
+        if ($hour >= $schedule_start->[0] && $min >= $schedule_start->[1]) {
+            # earlier that day
+            ($hour, $min) = @{$schedule_start};
+        } else {
+            ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst) = localtime($start - 86400);
+            ($hour, $min) = @{$schedule_start};
+        }
+    }
+    return sprintf("%04d-%02d-%02d %02d:%02d:%02d",
+                   $year+1900, $mon+1, $mday, $hour, $min, 0);
+}
+
+sub list_jobs {
+    my ($days, $hours, $name) = @_;
+
+    my $cutoff = cutoff_time($days, $hours);
+
+    my @where = ("(schedtime >= '$cutoff' OR endtime >= '$cutoff')");
+    push(@where, "jobstatus <> 'C'"); # waiting in scheduler queue
+    push(@where, "level = '$only_level'") if $only_level;
+    unless ($last_run_only) {
+        push(@where, "jobstatus <> 'T'") if $errors_only;
+        push(@where, "jobstatus <> 'W'") if ($errors_only && !$warnings);
+    }
+    if ($running) {
+        push(@where, "jobstatus IN ('T', 'W', 'R')") if $ok_only;
+    } else {
+        if ($ok_only) {
+            push(@where, "jobstatus IN ('T', 'W')");
+        } else {
+            push(@where, "jobstatus <> 'R'");
+        }
+    }
+    push(@where, "jobstatus <> 'A'") unless $include_cancels;
+
+    my $query;
+    my @bind_params = ();
+
+    if (defined $name) {
+        $name .= '%' unless ($name =~ /-job/ or $name =~ /[%_]/);
+        push(@where, "name LIKE ?");
+        push(@bind_params, $name);
+    }
+    if (defined $backup_exists) {
+        push(@where, "EXISTS (SELECT 1 FROM jobmedia jm WHERE jm.jobid = job.jobid)");
+    }
+
+    if ($last_run_only) {
+        $query = "SELECT DISTINCT ON (name) jobid FROM job WHERE ".
+            join(" AND ", @where) . " ORDER BY name, jobid DESC";
+    } else {
+        $query = "SELECT jobid FROM job WHERE ".
+            join(" AND ", @where);
+    }
+    my $ary_ref = $dbh->selectcol_arrayref($query, {}, @bind_params);
+    # Return result sorted by jobid
+    return sort(@{$ary_ref});
+}
+
+sub job_info {
+    my ($jobid) = @_;
+    
+    unless ($sth_job) {
+        $sth_job = $dbh->prepare("
+            SELECT level, jobstatus, name,
+                   EXTRACT('epoch' from endtime - starttime) AS duration,
+                   jobfiles, jobbytes, starttime,
+                   (SELECT count(*) FROM jobmedia jm WHERE jm.jobid = job.jobid)
+            FROM job WHERE jobid = ?");
+    }
+    $sth_job->execute($jobid);
+    my @row = $sth_job->fetchrow_array;
+    if ($row[1] eq 'R') {
+        unless ($sth_job_elapsed) {
+            my $tz = find_timezone();
+            $sth_job_elapsed = $dbh->prepare("
+                SELECT EXTRACT('epoch' FROM now() - starttime AT TIME ZONE '$tz') AS elapsed
+                FROM job WHERE jobid = ?");
+        }
+        $sth_job_elapsed->execute($jobid);
+        my ($elapsed) = $sth_job_elapsed->fetchrow_array;
+        $row[3] = $elapsed;
+        unless ($sth_job_elapsed_files) {
+            $sth_job_elapsed_files = $dbh->prepare("
+                SELECT MAX(lastindex) FROM JobMedia WHERE jobid = ?");
+        }
+        $sth_job_elapsed_files->execute($jobid);
+        my ($files) = $sth_job_elapsed_files->fetchrow_array;
+        $row[4] = $files || 0;
+        # TODO: figure out how to estimate jobbytes for running jobs
+        # (looks like it is impossible, though)
+    }
+
+    return @row;
+}
+
+# Attempt to find local time zone (possibly not the same as the database server)
+sub find_timezone {
+    # It is common to make this a symlink
+    if (my $l = readlink('/etc/localtime')) {
+        return $1 if $l =~ m:.*/zoneinfo/(.*):;
+    }
+    # Debian/Ubuntu has this file
+    if (open(my $f, '/etc/timezone')) {
+        my $l = <$f>;
+        chomp($l);
+        return $l;
+    }
+    # Punt.  The world revolves around me.
+    return 'Europe/Oslo';
+}
